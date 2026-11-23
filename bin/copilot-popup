@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Toggleable popup terminal launcher for Intel NPU Copilot (KDE / Wayland)
+set -euo pipefail
+
+LOCKFILE="/tmp/copilot-popup.lock"
+PIDFILE="/tmp/copilot-popup.pid"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NPU_AI_BIN="${NPU_AI_BIN:-$SCRIPT_DIR/npu-ai}"
+
+# Debounce rapid shortcut presses
+NOW=$(date +%s%N)
+LAST=$(cat "$LOCKFILE" 2>/dev/null || echo 0)
+DIFF=$(( (NOW - LAST) / 1000000 ))
+if [ "$DIFF" -lt 500 ]; then
+    exit 0
+fi
+echo "$NOW" > "$LOCKFILE"
+
+# Toggle off if already running
+if [ -f "$PIDFILE" ]; then
+    OLDPID=$(cat "$PIDFILE")
+    if kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        rm -f "$PIDFILE"
+        exit 0
+    fi
+fi
+
+konsole -qwindowtitle "Intel NPU Copilot" --hide-menubar --hide-tabbar --hide-toolbars -e "$NPU_AI_BIN" -i &
+echo $! > "$PIDFILE"

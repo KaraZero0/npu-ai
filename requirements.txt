@@ -1,0 +1,4 @@
+openvino>=2026.0
+openvino-genai>=2026.0
+numpy>=2.0
+pillow>=10.0

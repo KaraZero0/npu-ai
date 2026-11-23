@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+npu-ai: Local terminal AI helper running on Intel NPU (OpenVINO GenAI).
+Supports:
+  - Persistent user context (context.md)
+  - Long-term dynamic memory (memory.txt)
+  - Interactive learning: "remember that..." / "ricorda che..."
+  - Zsh ZLE widget integration for natural-language -> shell command generation
+"""
+
+import argparse
+import os
+import re
+import sys
+import time
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+BASE_DIR = Path(os.environ.get("NPU_AI_HOME", Path.home() / ".local" / "share" / "npu-ai"))
+MODEL_DIR = Path(
+    os.environ.get(
+        "NPU_AI_MODEL_DIR",
+        BASE_DIR / "models" / "llm" / "Qwen2.5-Coder-1.5B-Instruct-npu-ov",
+    )
+)
+CACHE_DIR = Path(os.environ.get("NPU_AI_CACHE_DIR", BASE_DIR / "models" / "cache"))
+CONTEXT_FILE = BASE_DIR / "context.md"
+MEMORY_FILE = BASE_DIR / "memory.txt"
+
+
+def load_context_and_memory() -> str:
+    parts = []
+    if CONTEXT_FILE.exists():
+        try:
+            parts.append(CONTEXT_FILE.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+
+    if MEMORY_FILE.exists():
+        try:
+            mem = MEMORY_FILE.read_text(encoding="utf-8").strip()
+            lines = [l for l in mem.splitlines() if l.strip() and not l.strip().startswith("#")]
+            if lines:
+                parts.append("## Learned Memory:\n" + "\n".join(lines))
+        except Exception:
+            pass
+
+    return "\n\n".join(parts)
+
+
+def append_memory(fact: str) -> None:
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"- {fact.strip()}\n")
+    except Exception as e:
+        print(f"\033[1;31m[Memory save error: {e}]\033[0m", file=sys.stderr)
+
+
+def get_system_prompt(is_cmd_only: bool = False) -> str:
+    ctx = load_context_and_memory()
+    ctx_block = f"User context:\n{ctx}\n\n" if ctx else ""
+
+    if is_cmd_only:
+        return (
+            "You are a Linux Zsh/Bash command generator (Arch/Debian, systemctl, journalctl, ss, find, ffmpeg, docker, tailscale). "
+            f"{ctx_block}"
+            "Return ONLY a single-line executable command, with no markdown ``` blocks, no explanations, and no extra text."
+        )
+
+    return (
+        "You are a local terminal AI assistant running on an Intel NPU via OpenVINO. "
+        "Reply concisely and practically (max 4-6 lines unless complex), providing exact ready-to-run commands.\n\n"
+        f"{ctx_block}"
+    )
+
+
+def check_and_learn(user_input: str) -> str | None:
+    """Detect if the user wants to store a persistent note."""
+    patterns = [
+        r"^(?:remember|note|save|memorize)(?:\s+that)?\s+(.+)$",
+        r"^(?:ricorda|memorizza|tieni a mente|salva)(?:\s+che)?\s+(.+)$",
+        r"^nota(?:\s+che)?\s+(.+)$",
+        r"^impara(?:\s+che)?\s+(.+)$",
+    ]
+    for pat in patterns:
+        m = re.match(pat, user_input.strip(), re.IGNORECASE)
+        if m:
+            fact = m.group(1).strip()
+            append_memory(fact)
+            return fact
+    return None
+
+
+def load_pipeline(device: str = "NPU"):
+    import openvino_genai as ov_genai
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        return ov_genai.LLMPipeline(str(MODEL_DIR), device, CACHE_DIR=str(CACHE_DIR)), device
+    except Exception as e:
+        print(f"\033[1;33m⚠ [NPU AI] Falling back to GPU ({e})\033[0m", file=sys.stderr)
+        return ov_genai.LLMPipeline(str(MODEL_DIR), "GPU", CACHE_DIR=str(CACHE_DIR)), "GPU"
+
+
+def format_qwen_prompt(system_prompt: str, user_prompt: str) -> str:
+    return (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="npu-ai",
+        description="Local terminal AI assistant accelerated on Intel NPU (OpenVINO GenAI)",
+    )
+    parser.add_argument("prompt", nargs="*", help="Question or command description")
+    parser.add_argument("-c", "--cmd", action="store_true", help="Output ONLY a single shell command")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Start interactive chat mode")
+    parser.add_argument("-d", "--device", default="NPU", choices=["NPU", "GPU", "CPU"], help="OpenVINO device")
+    parser.add_argument("-m", "--max-tokens", type=int, default=220, help="Maximum generated tokens")
+    args = parser.parse_args()
+
+    piped_input = ""
+    if not sys.stdin.isatty():
+        piped_input = sys.stdin.read().strip()
+
+    user_query = " ".join(args.prompt).strip()
+
+    if user_query and not args.interactive:
+        learned = check_and_learn(user_query)
+        if learned:
+            print(f"\033[1;32m✔ [Memory saved]:\033[0m {learned}")
+            return 0
+
+    if not user_query and not piped_input and not args.interactive:
+        parser.print_help()
+        print("\n\033[1;36mExamples:\033[0m")
+        print('  npu-ai "remember that the new service port is 8080"')
+        print('  npu-ai -c "find all files larger than 100MB in home"')
+        print("  npu-ai -i   # Interactive chat on NPU")
+        return 0
+
+    if not MODEL_DIR.exists():
+        print(f"\033[1;31m✘ Model directory not found:\033[0m {MODEL_DIR}", file=sys.stderr)
+        print("Set NPU_AI_MODEL_DIR or place the OpenVINO IR model in models/llm/.", file=sys.stderr)
+        return 1
+
+    import openvino_genai as ov_genai
+
+    t0 = time.perf_counter()
+    if not args.cmd and sys.stderr.isatty():
+        print(f"\033[2m⚡ Loading Intel {args.device}...\033[0m", end="\r", file=sys.stderr, flush=True)
+
+    pipe, active_dev = load_pipeline(args.device)
+    load_dt = time.perf_counter() - t0
+    if not args.cmd and sys.stderr.isatty():
+        print(" " * 40, end="\r", file=sys.stderr, flush=True)
+
+    config = ov_genai.GenerationConfig()
+    config.max_new_tokens = 128 if args.cmd else args.max_tokens
+    config.do_sample = False
+
+    def streamer(subword: str) -> bool:
+        sys.stdout.write(subword)
+        sys.stdout.flush()
+        return False
+
+    if args.interactive:
+        print(f"\033[1;36m⚡ Intel {active_dev} Shell Helper active\033[0m (loaded in {load_dt:.2f}s — type 'exit' to quit)")
+        print("\033[2m💡 Tip: type 'remember that <fact>' to save persistent context.\033[0m")
+
+        sys_prompt = get_system_prompt(is_cmd_only=False)
+        history = ov_genai.ChatHistory([{"role": "system", "content": sys_prompt}])
+        try:
+            while True:
+                try:
+                    q = input("\n\033[1;32m❯ \033[0m").strip()
+                except EOFError:
+                    break
+                if not q or q.lower() in ("exit", "esci", "quit", "q"):
+                    break
+
+                learned = check_and_learn(q)
+                if learned:
+                    print(f"\033[1;32m✔ Saved to memory:\033[0m {learned}")
+                    history.append({"role": "user", "content": q})
+                    history.append({"role": "assistant", "content": f"Saved to persistent memory: {learned}"})
+                    continue
+
+                history.append({"role": "user", "content": q})
+                t_gen = time.perf_counter()
+                ans = pipe.generate(history, config, streamer)
+                dt_gen = time.perf_counter() - t_gen
+                history.append({"role": "assistant", "content": str(ans)})
+                print(f"\n\033[2m[{active_dev} • {dt_gen:.2f}s]\033[0m")
+        except KeyboardInterrupt:
+            print()
+        return 0
+
+    if piped_input:
+        if user_query:
+            full_user = f"{user_query}\n\nTerminal output/log:\n```\n{piped_input[-2500:]}\n```"
+        else:
+            full_user = f"Explain this terminal output/log:\n```\n{piped_input[-2500:]}\n```"
+    else:
+        full_user = user_query
+
+    sys_prompt = get_system_prompt(is_cmd_only=args.cmd)
+    formatted = format_qwen_prompt(sys_prompt, full_user)
+
+    t_gen = time.perf_counter()
+    if args.cmd:
+        out = pipe.generate(formatted, config).strip()
+        if out.startswith("```"):
+            lines = [l for l in out.splitlines() if not l.strip().startswith("```")]
+            out = "\n".join(lines).strip()
+        out = out.strip("`").strip()
+        print(out)
+    else:
+        print(f"\033[1;36m⚡ [{active_dev}]\033[0m ", end="", flush=True)
+        pipe.generate(formatted, config, streamer)
+        dt_gen = time.perf_counter() - t_gen
+        print(f"\n\033[2m[{active_dev} • load {load_dt:.2f}s • gen {dt_gen:.2f}s]\033[0m")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

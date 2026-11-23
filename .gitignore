@@ -1,0 +1,15 @@
+# Virtual environments & caches
+npu_env/
+.venv/
+__pycache__/
+*.pyc
+
+# Local models & OpenVINO compiled blobs
+models/
+cache/
+
+# Personal context, learned memory & secrets
+context.md
+memory.txt
+.env
+*.key
